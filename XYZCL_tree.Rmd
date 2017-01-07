@@ -1,0 +1,217 @@
+---
+title: 'Implementing CL-tree and Inference: 3D Human Body'
+---
+
+Write the Chow Liu Algorithm for a Gaussian case: PPCA
+1) compute all pairwise mutual information between each data point
+2) perform CL maximum weight tree described at the original paper
+
+```{r}
+### Covariance matrix by FA:
+
+data_cov <- A_init%*%t(A_init) + Sigmaz_init
+data_cor <- cov2cor(data_cov) # for stability of values
+
+### Finding the pairwise mutual information values:
+mut_info <- mat.or.vec(nrow(data_cor),ncol(data_cor))
+for (i in 1:nrow(data_cor)){
+  for (j in 1:ncol(data_cor)){
+  if (i!=j){  
+    mut_info[i,j] <- 0.5*log2(data_cor[i,i]*data_cor[j,j]/det(data_cor[c(i,j),c(i,j)]))
+  }
+  else{
+    mut_info[i,j] <-0
+  }
+  }
+}
+
+#X_mut_info[lower.tri(X_mut_info)] <- 0 # only keeping upper triangular part
+### Finding the adjacency matrix of maximum spanning tree:
+library(ape)
+data_CL <- mst(-mut_info) # minimum spanning tree of -X_mut_info is the same as      
+                        #finding the maximum weight spanning tree, i.e., CL tree
+# plot(data_CL)
+
+```
+
+Now, we need to update the weights accordingly,
+First, the edge weights and varianaces will be updated in the covariance matrix
+Then, according to edge weights, we can find all other covariance values
+between non-neighbor nodes:
+
+```{r}
+library('igraph')
+data_graph <- graph.adjacency(data_CL) # turn adjacency matrix to graph object
+data_init <- data_CL*data_cor # to quickly find all edge-weights
+data_init <- data_init + diag(nrow(data_init)) # adding back variances on diagonal
+
+len = length(distance_table(data_graph)[[1]]) + 1
+paths <- matrix(0,nrow(data_init)^2,len)
+size <- nrow(data_init)
+
+ptm <- proc.time()
+for(i in 1:nrow(data_init)){
+  for(j in 1:ncol(data_init)){
+    if (i!=j & j>i){
+      path <- get.shortest.paths(data_graph,i,j)[[1]][[1]]
+      paths[(i-1)*size + j,1:length(path)] <- path
+    }
+  }
+}
+
+####deduce all other correlation values by product of edge weights along the path
+for(i in 1:nrow(data_init)){
+  for(j in 1:ncol(data_init)){
+    if(data_init[i,j]==0 & j>i){
+      path <- paths[(i-1)*size+j,]
+      path <- path[which(path!=0)]
+      weight <- 1
+      for(k in 1:(length(path)-1)){
+        weight <- weight*data_init[path[k],path[k+1]]
+        data_init[path[1],path[k+1]] <- weight
+        data_init[path[k+1],path[1]] <- weight
+      }
+#       data_init[i,j] <- weight
+#       data_init[j,i] <- weight
+      weight <- 1
+    }
+  }
+}
+
+data_CLcor <- as.matrix(data_init)
+
+
+write.table(data_CLcor,"data_CLcor_50PCA.csv",sep=",")
+# data_CLinv <- solve(data_CLcor) # cpaturing the sparsity of CL-tree
+
+proc.time() - ptm
+
+```
+
+
+P.S.
+Note that the determinant of a Gaussian tree with normalized variances can be determined by product of the terms: (1-Wij^2)
+
+Now, what if several neighbors of a hidden node are also missing.
+Here is the proposed solution:
+1) update all hidden node values initially: by taking a sample from the subset covariance Sigma_Y
+2) Now, all the hidden nodes, have some intial values, so update their values by sampling from their conditional density given the values of all of its neighbors.
+Note that these given values are two types: fixed (those that are observed) and previous values of hidden nodes sampled from previous distribution
+
+3) iterate step two several times, or untill convergence based on some metrics, such as closeness of KL distances between conditional densities of current and previous time slot:
+
+```{r}
+library('MASS')
+
+## libraries needed for parallelization
+library(doSNOW)
+library(foreach)
+library(parallel)
+no_cores <- detectCores()
+cl<-makeCluster(no_cores) #change the 2 to your number of CPU cores
+registerDoSNOW(cl)
+
+## Attention: We need to revert the correlations back to covariance values
+datacov <- sqrt(diag(diag(data_cov)))%*%data_CLcor%*%sqrt(diag(diag(data_cov)))
+
+N_hidden <- 500
+# max_index <- 1274
+ptm <- proc.time()
+### Parallel outer loop
+error_vals <- foreach(t=1:nrow(test_data),.packages=c('igraph','MASS')) %dopar% { # doing this for test data 
+  
+  real_data <- test_data[t,]
+  data_obs <- real_data
+
+#### Let's choose hidden nodes from this vector randomly:
+#hidden_index <- sample(1:length(real_data),1500,replace=FALSE) # random choices
+# hidden_index <- max_index:(max_index + N_hidden) # Worst Chunk!
+hidden_index <- hidden_index_mat[t,]
+data_hidden <- real_data[hidden_index] # the True values for hidden variables
+
+# finding all of these nodes neighbors
+data_neighbor <- matrix(0,length(data_hidden),length(real_data))  # pessimistic: Zero matrix initialization
+for(i in 1:length(data_hidden)){
+  neighbors <- neighborhood(data_graph,1,hidden_index[i])[[1]]
+  len <- length(neighbors)
+  data_neighbor[i,1:len] <- neighbors
+}
+data_neighbor <- data_neighbor[,2:ncol(data_neighbor)]
+
+########### Initial values for these hidden nodes: sampling from multivariate Gaussian
+data_hide_init <- mvrnorm(1,data_mean[hidden_index],datacov[hidden_index,hidden_index])
+
+# initialiazing previous values in the following for loop:
+data_obs[hidden_index] <- data_hide_init
+
+# Finding the conditional covariance values, since these do not depend on samples:
+cond_cov <- matrix(0,1,length(data_hidden))
+for(i in 1:length(data_hidden)){
+  neighbors <- data_neighbor[i,]
+  neighbors <- neighbors[neighbors!=0]
+  cond_cov[i] <- datacov[hidden_index[i],hidden_index[i]]- datacov[hidden_index[i],neighbors]%*%chol2inv(chol(datacov[neighbors,neighbors]))%*%datacov[hidden_index[i],neighbors]
+}
+
+##########
+cond_mean <- matrix(0,1,length(data_hidden))
+s <- matrix(0,1,length(data_hidden))
+i <- 0
+threshold <- 1
+gibbs_samples <- matrix(0,1,length(hidden_index))
+counter <- 0
+while(i<200){
+#   first_mean <- cond_mean
+  for(j in 1:length(data_hidden)){
+    neighbors <- data_neighbor[j,]
+    neighbors <- neighbors[neighbors!=0]
+    cond_mean[j] <- data_mean[hidden_index[j]] + datacov[hidden_index[j],neighbors]%*%chol2inv(chol(datacov[neighbors,neighbors]))%*%(unlist(data_obs[neighbors]-data_mean[neighbors]))
+    s[j] <- mvrnorm(1,cond_mean[j],cond_cov[j])
+  }
+  ############## update the observations
+  data_obs[hidden_index] <- s
+#   second_mean <- cond_mean
+#   threshold <- sum(abs(first_mean-second_mean))
+  i <- i + 1
+  
+  ### Keeping track of samples: ==> Adding all of them together to find the conditional mean that is the best estimation of missing values
+if(i>=50 & i%%5==0){
+  gibbs_samples <- gibbs_samples + s
+  counter <- counter + 1
+}
+# In the last iteration, replace the conditional mean as an estimation of missing values
+if (i==200){
+  data_obs[hidden_index] <- gibbs_samples/counter
+}
+
+}
+
+# printing the difference between random sampling and our method
+#sum(abs(real_data))
+L1error_CL <- sum(abs(real_data-data_obs))
+#error_random <- sum(abs(real_data[hidden_index]-data_hide_init))
+#error_mean <- sum(abs(real_data[hidden_index]-data_mean[hidden_index]))
+
+L2error_CL <- sqrt(sum((real_data-data_obs)^2))
+
+combo <- c(L1error_CL,L2error_CL)
+}
+
+temp_list <- unlist(error_vals) # converting a list to a vector
+
+L1error_CL <- temp_list[seq(1,length(temp_list),2)]
+L2error_CL <- temp_list[seq(2,length(temp_list),2)]
+#error_random <- temp_list[seq(2,length(temp_list),3)]
+#error_mean <- temp_list[seq(3,length(temp_list),3)]
+
+write.table(L1error_CL,"L1errCL500_PCA_rand_gibbs2.csv",sep=",")
+write.table(L2error_CL,"L2errCL500_PCA_rand_gibbs2.csv",sep=",")
+#write.table(error_random,"errRand1000_chunk.csv",sep=",")
+#write.table(error_mean,"errMean1000_chunk.csv",sep=",")
+
+stopCluster(cl)
+
+proc.time()-ptm
+
+
+
+```
