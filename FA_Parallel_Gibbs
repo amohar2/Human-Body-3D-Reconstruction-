@@ -1,0 +1,495 @@
+---
+title: "Factor Analysis+Gibbs Sampling, Semi-Parallel Version"
+---
+
+Parallel Version:
+Performing FA on data.
+Maximization is done by EM algorithm:
+
+```{r}
+#######################
+###########################
+## see https://people.eecs.berkeley.edu/~jordan/courses/281A-fall04/lectures/lec-11-2.pdf 
+## possibly has typos!
+## Also see https://www.cs.princeton.edu/courses/archive/fall10/cos513/notes/2010-11-17.pdf
+## Also see http://users.isr.ist.utl.pt/~wurmd/Livros/school/Bishop%20-%20Pattern%20Recognition%20And%20Machine%20Learning%20-%20Springer%20%202006.pdf
+
+## We assume X = A*Y + Z:
+
+#############
+#This should be run on supercomputer
+
+human_data <- read.csv('data1517.csv')
+
+train_data <- human_data[1:500,seq(2,2275)]
+data_cor <- cor(train_data)
+data_cov <- cov(train_data)
+data_mean <- colSums(train_data)/nrow(train_data)
+
+library('MASS')
+N_vars <- ncol(train_data) # Number of observed variables that are the outputs of FA
+#N_vars <- 500
+PCAs <- 50 # Number of PCAs included
+test <- matrix(as.matrix(train_data[,1:N_vars]),nrow(train_data[,1:N_vars]),ncol(train_data[,1:N_vars]))
+A_init <- .001*matrix(rep(1,PCAs*N_vars),N_vars,PCAs)
+Sigmaz_init <- .001*diag(N_vars)
+#Sigmaz_init <- matrix(0,N_vars,N_vars)
+test <- test - matrix(data_mean[1:N_vars],1)[rep(1,nrow(test)),] # centralize the data
+test_mean <- colMeans(test) # this vector is really close to zero
+#init_expec <- c(0,0,0,0)
+E_mean <- matrix(0,nrow(test),PCAs)
+E_sigma <- array(0, c(nrow(test),PCAs,PCAs))
+Sigma_Y <- diag(PCAs) # identity matrix, capturing correlations of FAs
+Mean_Y <- rep(0,PCAs) # mean vector of PCAs
+Mean_Z <- rep(0,N_vars) # mean of noise vector
+
+
+library(doSNOW)
+library(foreach)
+library(parallel)
+no_cores <- detectCores()
+cl<-makeCluster(no_cores) #change the 2 to your number of CPU cores
+registerDoSNOW(cl)
+#registerDoParallel(cl)
+
+ptm <- proc.time()
+
+for(t in 1:20) {
+  values <- foreach(i=1:nrow(test)) %dopar% {
+    ## E-Step:
+    temp <- t(A_init)%*%chol2inv(chol(A_init%*%t(A_init)+Sigmaz_init))
+    cond_expec <- Mean_Y + temp%*%(test[i,]-test_mean)
+    cond_sigma <- Sigma_Y - temp%*%A_init + cond_expec%*%t(cond_expec)
+    #E_mean[i,] <- cond_expec
+    #E_sigma[i,,] <- cond_sigma
+    #combo <- c(E_mean[i,],E_sigma[i,,])
+    combo <- c(cond_expec,cond_sigma)
+  }
+  
+  for(num in 1:nrow(test)){
+    E_mean[num,] <- values[[num]][1:PCAs]
+  }
+  
+  for(num in 1:nrow(test)){
+    E_sigma[num,,] <- matrix(values[[num]][-(1:PCAs)],PCAs,PCAs)
+  }
+  
+  # M-Step:
+  # First update A_init:
+  # outer product of each sample: test[i,], with E_mean[i,]
+  # this results in 500 matrices with size N_vars*PCAs
+  sum_samp <- matrix(0,N_vars,PCAs)
+  for(samp in 1:nrow(test)){
+    sum_samp <- sum_samp + test[samp,]%o%E_mean[samp,]
+  }
+  temp_sum <- apply(E_sigma,c(2,3),sum)
+  A_init <- sum_samp%*%chol2inv(chol(temp_sum))
+  #####################
+  # Now use the updated A_init to update Sigmaz_init:
+  sum_residue <- matrix(0,N_vars,N_vars)
+  for(samp in 1:nrow(test)){
+    temp <- (test[samp,]-t(A_init%*%E_mean[samp,]))%o%test[samp,]
+    sum_residue <- sum_residue + temp[1,,]
+  }
+  Sigmaz_init <- 1/nrow(test)*diag(diag(sum_residue))
+  #  output_cov <- A_init%*%t(A_init) + Sigmaz_init
+  #  print(output_cov[1:5,1:5])
+}
+
+# c<-2
+# m <- foreach(j=2:5) %do% {
+#   x <- matrix(c(j^2,j,j^4,5),2,2)
+#   y <- j^3
+#   z <- c(x,y)
+# }
+
+output_cov <- A_init%*%t(A_init) + Sigmaz_init
+
+write.table(A_init,"a50.csv",sep=",")
+write.table(Sigmaz_init,"sigmaz50.csv",sep=",")
+
+stopCluster(cl)
+
+proc.time()-ptm
+
+
+# look at upper bounds on determinants ==> det<= (Trace/n)^n, n: is dimension
+# now by deviding two upper bounds you get (Trace1/Trace2)^n
+# now the upper bound on entropy is logarithm of this
+# another lower and upper bound is tr(I-A^-1)<=log|A|<=tr(A-I)
+
+```
+
+
+Let's plot the data to see hat happens if we manually change FA inputs, and generate data from these FAs:
+
+
+```{r}
+library('rgl')
+
+test_data <- human_data[-(1:500),seq(2,2275)]
+PCAs <- 50
+Sigma_Y <- diag(PCAs) # identity matrix, capturing correlations of PCAs
+Mean_Y <- rep(0,PCAs) # mean vector of PCAs
+Mean_Z <- rep(0,N_vars) # mean of noise vector
+
+A_init <- read.csv('a50.csv')
+A_init <- matrix(as.matrix(A_init[,1:PCAs]),nrow(A_init),ncol(A_init))
+
+Sigmaz_init <- read.csv('sigmaz50.csv')
+Sigmaz_init <- as.matrix(Sigmaz_init)
+Sigmaz_init <- diag(diag(Sigmaz_init))
+
+pca_rand <- mvrnorm(1,Mean_Y,Sigma_Y)
+print(pca_rand)
+#pca_rand <- 100
+data_generate <- t(A_init%*%pca_rand) + mvrnorm(1,Mean_Z,Sigmaz_init) + data_mean[1:N_vars]
+# data_generate <- mvrnorm(1,Mean_Z,Sigmaz_init)
+# data_generate <- data_mean[1:N_vars]
+data_generate <- t(A_init%*%pca_rand) + mvrnorm(1,Mean_Z,Sigmaz_init)
+
+open3d()
+for(i in 1:(N_vars/3)){
+    points3d(x=test_data[1,3*i-2], y =test_data[1,3*i-1], z =test_data[1,3*i], col = "black", scale = 3)
+    points3d(x=data_generate[3*i-2], y =data_generate[3*i-1], z =data_generate[3*i], col = "red", scale = 3)
+    }
+
+axes3d(c('x--','y+-','z--'))
+box3d()
+
+title <- sprintf("Black: True (Arm #501) & Red: Synthesized & PCA= %f",pca_rand)
+title3d(main = "", sub=title, xlab = 'X', ylab = 'Y', zlab = 'Z')
+rgl.postscript("1PPCA_Only.pdf","pdf")
+
+#Not bad At all!
+
+```
+
+
+Let's infer the missing values, conditioned on observed values: (iterative method)
+
+```{r}
+
+
+## libraries needed for parallelization
+library(doSNOW)
+library(foreach)
+library(parallel)
+no_cores <- detectCores()
+cl<-makeCluster(no_cores) #change the 2 to your number of CPU cores
+registerDoSNOW(cl)
+
+library('MASS')
+test_data <- human_data[1001:nrow(human_data),seq(2,2275)]
+test_data <- matrix(as.matrix(test_data),nrow(test_data),ncol(test_data))
+
+##### Initializiation and some initial procedeures
+
+### Overall covariance matrix between Y's X's, and (X,Y)'s
+output_cov <- A_init%*%t(A_init) + Sigmaz_init
+right <- rbind(t(A_init),output_cov)
+left <- rbind(Sigma_Y,A_init)
+overall_cov <- cbind(left,right)
+overall_mean <- c(Mean_Y,data_mean)
+
+### Hidden variables for each test row: so overall we need 517 hidden vectors
+#### Let's choose hidden nodes from this vector randomly:
+
+N_hidden <- 500 # number of hidden data points
+### max_index should be set appropriately from other codes
+max_index <- 1774
+
+
+# Finding the conditional covariance values, since these do not depend on samples:
+# cond_cov <- matrix(0,1,(N_hidden+PCAs))
+cond_cov <- matrix(0,(N_hidden+PCAs),(N_hidden+PCAs))
+
+neighbors <- PCAs + 1:ncol(test_data)
+temp_inv1 <- chol2inv(chol(overall_cov[neighbors,neighbors]))
+# for(i in 1:PCAs){
+#   cond_cov[i] <- overall_cov[i,i]- overall_cov[i,neighbors]%*%temp_inv1%*%overall_cov[i,neighbors]
+# }
+cond_cov[1:PCAs,1:PCAs] <- overall_cov[1:PCAs,1:PCAs] - overall_cov[1:PCAs,neighbors]%*%temp_inv1%*%overall_cov[neighbors,1:PCAs]
+
+# This is needed for another conditional covariance matrix regarding to leaf nodes
+neighbors <- 1:PCAs
+temp_inv2 <- chol2inv(chol(overall_cov[neighbors,neighbors]))
+
+
+###############################
+################################
+################################
+################################
+#################################
+#### Parallel Loop
+
+ptm <- proc.time()
+
+return_vals <- foreach(t=1:nrow(test_data),.packages=c('rgl','MASS')) %dopar% {
+  
+  real_data <- test_data[t,]
+  data_obs <- real_data
+
+#### Let's choose hidden nodes from this vector randomly:
+# Random choices
+#hidden_index <- sample((1+PCAs):(length(real_data)+PCAs),N_hidden,replace=FALSE)
+# worst case chunk:
+# hidden_index <- PCAs + (max_index+1):(max_index + N_hidden)
+hidden_index <- PCAs + hidden_index_mat[t,]
+hidden_index1 <- hidden_index - PCAs
+#data_noise <- real
+
+# neighbors <- 1:PCAs
+# for(i in 1:length(hidden_index)){
+#   cond_cov[i+PCAs] <- overall_cov[hidden_index[i],hidden_index[i]]- overall_cov[hidden_index[i],neighbors]%*%temp_inv2%*%overall_cov[hidden_index[i],neighbors]
+# }
+# cond_cov[hidden_index,hidden_index] <- overall_cov[hidden_index,hidden_index] - overall_cov[hidden_index,neighbors]%*%temp_inv2%*%overall_cov[neighbors,hidden_index]
+
+########### Initial values for these hidden nodes: sampling from multivariate Gaussian
+data_hide_init <- mvrnorm(1,overall_mean[hidden_index],overall_cov[hidden_index,hidden_index])
+
+# initialiazing previous values in the following for loop:
+data_obs[hidden_index1] <- data_hide_init
+
+########## updating the conditional expectations
+#### Use values from leaves to update PCAs
+#### Then use updated PCAs, to predict hidden values
+#### Iterate!
+cond_mean <- matrix(0,1,(length(hidden_index)+PCAs))
+s <- matrix(0,1,length(hidden_index))
+pca_samps <- matrix(0,1,PCAs)
+i <- 0
+threshold <- 1
+gibbs_samples <- matrix(0,length(hidden_index1),1)
+counter <- 0
+while(i<200){ # Gibbs Sampling
+#   first_mean <- cond_mean
+  neighbors <- PCAs + 1:length(real_data)
+  #temp_inv <- chol2inv(chol(overall_cov[neighbors,neighbors]))
+#   for(k in 1:PCAs){
+#         cond_mean[k] <- Mean_Y[k] + overall_cov[k,neighbors]%*%temp_inv1%*%(unlist(data_obs[neighbors-PCAs]-overall_mean[neighbors]))
+#         pca_samps[k] <- mvrnorm(1,cond_mean[k],cond_cov[k])
+#   }
+  cond_mean[1:PCAs] <- Mean_Y + overall_cov[1:PCAs,neighbors]%*%temp_inv1%*%(unlist(data_obs[neighbors-PCAs]-overall_mean[neighbors]))
+  pca_samps <- mvrnorm(1,cond_mean[1:PCAs],cond_cov[1:PCAs,1:PCAs])
+  
+#   neighbors <- 1:PCAs
+  #temp_inv <- chol2inv(chol(overall_cov[neighbors,neighbors]))
+#   for(j in 1:length(hidden_index)){
+#     cond_mean[j+PCAs] <- data_mean[hidden_index1[j]] + overall_cov[hidden_index[j],neighbors]%*%temp_inv2%*%(unlist(pca_samps[neighbors]-overall_mean[neighbors]))
+#     s[j] <- mvrnorm(1,cond_mean[j+PCAs],cond_cov[j+PCAs])
+#   }
+#  cond_mean[-(1:PCAs)] <- data_mean[hidden_index1] + overall_cov[hidden_index,neighbors]%*%temp_inv2%*%(unlist(pca_samps[neighbors]-overall_mean[neighbors]))
+  s <- A_init[hidden_index1,]%*%pca_samps + data_mean[hidden_index1] + mvrnorm(1,matrix(0,1,length(hidden_index1)),Sigmaz_init[hidden_index1,hidden_index1])
+ # s <- mvrnorm(1,cond_mean[-(1:PCAs)],cond_cov[(PCAs+1:length(hidden_index)),(PCAs+1:length(hidden_index))])
+
+  ############## update the observations
+  data_obs[hidden_index1] <- s
+#   second_mean <- cond_mean
+#   threshold <- max(abs(first_mean-second_mean))
+  i <- i + 1
+
+### Keeping track of samples: ==> Adding all of them together to find the conditional mean that is the best estimation of missing values
+if(i>=50 & i%%5==0){
+  gibbs_samples <- gibbs_samples + s
+  counter <- counter + 1
+}
+# In the last iteration, replace the conditional mean as an estimation of missing values
+if (i==200){
+  data_obs[hidden_index1] <- gibbs_samples/counter
+}
+
+}
+
+# printing the difference between random sampling and our method
+#sum(abs(real_data))
+# L1error_PCA <- sum(abs(real_data-data_obs))
+# L1error_random <- sum(abs(real_data[hidden_index1]-data_hide_init))
+# L1error_mean <- sum(abs(real_data[hidden_index1]-data_mean[hidden_index1]))
+# 
+ L2error_PCA <- sqrt(sum((real_data-data_obs)^2))
+# L2error_random <- sum((real_data[hidden_index1]-data_hide_init)^2)
+# L2error_mean <- sum((real_data[hidden_index1]-data_mean[hidden_index1])^2)
+
+#  combo <- c(L1error_PCA,L1error_random,L1error_mean,L2error_PCA,L2error_random,L2error_mean)
+
+combo <- L2error_PCA
+
+
+}
+
+temp_list <- unlist(return_vals) # converting a list to a vector
+
+L2error_PCA <- temp_list[seq(1,length(temp_list),1)]
+
+write.table(L2error_PCA,"L2err50PCA500_gibbs2_rand.csv",sep=",")
+
+# L1error_PCA <- temp_list[seq(1,length(temp_list),6)]
+# L1error_random <- temp_list[seq(2,length(temp_list),6)]
+# L1error_mean <- temp_list[seq(3,length(temp_list),6)]
+# L2error_PCA <- temp_list[seq(4,length(temp_list),6)]
+# L2error_random <- temp_list[seq(5,length(temp_list),6)]
+# L2error_mean <- temp_list[seq(6,length(temp_list),6)]
+# #data_generated <- temp_list[seq(7,length(temp_list),7)]
+# 
+# write.table(L1error_PCA,"L1err50PCA1000_chunk.csv",sep=",")
+# write.table(L1error_random,"L1errorRand1000_chunk.csv",sep=",")
+# write.table(L1error_mean,"L1errorMean1000_chunk.csv",sep=",")
+# write.table(L2error_PCA,"L2err50PCA1000_chunk.csv",sep=",")
+# write.table(L2error_random,"L2errorRand1000_chunk.csv",sep=",")
+# write.table(L2error_mean,"L2errorMean1000_chunk.csv",sep=",")
+# #write.table(data_generated,"generate_50PCA500_chunk.csv",sep=",")
+
+stopCluster(cl)
+
+proc.time()-ptm
+
+
+
+
+```
+
+
+In The previous one we considered the FCs to be conditionally indep. given observations, which is wrong.
+So, here is the correct version:
+
+
+```{r}
+
+
+## libraries needed for parallelization
+library(doSNOW)
+library(foreach)
+library(parallel)
+no_cores <- detectCores()
+cl<-makeCluster(no_cores) #change the 2 to your number of CPU cores
+registerDoSNOW(cl)
+
+library('MASS')
+test_data <- human_data[1001:nrow(human_data),seq(2,2275)]
+test_data <- matrix(as.matrix(test_data),nrow(test_data),ncol(test_data))
+
+##### Initializiation and some initial procedeures
+
+### Overall covariance matrix between Y's X's, and (X,Y)'s
+output_cov <- A_init%*%t(A_init) + Sigmaz_init
+right <- rbind(t(A_init),output_cov)
+left <- rbind(Sigma_Y,A_init)
+overall_cov <- cbind(left,right)
+overall_mean <- c(Mean_Y,data_mean)
+
+### Hidden variables for each test row: so overall we need 517 hidden vectors
+#### Let's choose hidden nodes from this vector randomly:
+
+N_hidden <- 1000 # number of hidden data points
+
+
+# Finding the conditional covariance values, since these do not depend on samples:
+# cond_cov <- matrix(0,1,(N_hidden+PCAs))
+cond_cov <- matrix(0,(N_hidden+PCAs),(N_hidden+PCAs))
+
+neighbors <- PCAs + 1:ncol(test_data)
+temp_inv1 <- chol2inv(chol(overall_cov[neighbors,neighbors]))
+
+cond_cov[1:PCAs,1:PCAs] <- overall_cov[1:PCAs,1:PCAs] - overall_cov[1:PCAs,neighbors]%*%temp_inv1%*%overall_cov[neighbors,1:PCAs]
+
+# This is needed for another conditional covariance matrix regarding to leaf nodes
+neighbors <- 1:PCAs
+temp_inv2 <- chol2inv(chol(overall_cov[neighbors,neighbors]))
+
+
+
+#### Parallel Loop
+
+ptm <- proc.time()
+
+return_vals <- foreach(t=1:nrow(test_data),.packages=c('rgl','MASS')) %dopar% {
+  
+  real_data <- test_data[t,]
+  data_obs <- real_data
+
+#### Let's choose hidden nodes from this vector randomly:
+# Random choices
+#hidden_index <- sample((1+PCAs):(length(real_data)+PCAs),N_hidden,replace=FALSE)
+# worst case chunk:
+hidden_index <- PCAs + (max_index+1):(max_index + N_hidden)
+# hidden_index <- PCAs + hidden_index_mat[t,]
+hidden_index1 <- hidden_index - PCAs
+#data_noise <- real
+
+neighbors <- 1:PCAs
+
+cond_cov[(PCAs+1:length(hidden_index)),(PCAs+1:length(hidden_index))] <- overall_cov[hidden_index,hidden_index] - overall_cov[hidden_index,neighbors]%*%temp_inv2%*%overall_cov[neighbors,hidden_index]
+
+########### Initial values for these hidden nodes: sampling from multivariate Gaussian
+data_hide_init <- mvrnorm(1,overall_mean[hidden_index],overall_cov[hidden_index,hidden_index])
+
+# initialiazing previous values in the following for loop:
+data_obs[hidden_index1] <- data_hide_init
+
+########## updating the conditional expectations
+#### Use values from leaves to update PCAs
+#### Then use updated PCAs, to predict hidden values
+#### Iterate!
+cond_mean <- matrix(0,1,(length(hidden_index)+PCAs))
+s <- matrix(0,1,length(hidden_index))
+pca_samps <- matrix(0,1,PCAs)
+i <- 0
+threshold <- 1
+while(i<200 && threshold>0.001){ # Gibbs Sampling
+  first_mean <- cond_mean
+  neighbors <- PCAs + 1:length(real_data)
+
+  cond_mean[1:PCAs] <- Mean_Y + overall_cov[1:PCAs,neighbors]%*%temp_inv1%*%(unlist(data_obs[neighbors-PCAs]-overall_mean[neighbors]))
+  pca_samps <- mvrnorm(1,cond_mean[1:PCAs],cond_cov[1:PCAs,1:PCAs])
+  
+  neighbors <- 1:PCAs
+
+  cond_mean[-(1:PCAs)] <- data_mean[hidden_index1] + overall_cov[hidden_index,neighbors]%*%temp_inv2%*%(unlist(pca_samps[neighbors]-overall_mean[neighbors]))
+  s <- mvrnorm(1,cond_mean[-(1:PCAs)],cond_cov[(PCAs+1:length(hidden_index)),(PCAs+1:length(hidden_index))])
+
+  ############## update the observations
+  data_obs[hidden_index1] <- s
+  second_mean <- cond_mean
+  threshold <- max(abs(first_mean-second_mean))
+  i <- i + 1
+}
+
+# printing the difference between random sampling and our method
+#sum(abs(real_data))
+L1error_PCA <- sum(abs(real_data-data_obs))
+L1error_random <- sum(abs(real_data[hidden_index1]-data_hide_init))
+L1error_mean <- sum(abs(real_data[hidden_index1]-data_mean[hidden_index1]))
+
+L2error_PCA <- sum((real_data-data_obs)^2)
+L2error_random <- sum((real_data[hidden_index1]-data_hide_init)^2)
+L2error_mean <- sum((real_data[hidden_index1]-data_mean[hidden_index1])^2)
+
+combo <- c(L1error_PCA,L1error_random,L1error_mean,L2error_PCA,L2error_random,L2error_mean)
+}
+
+temp_list <- unlist(return_vals) # converting a list to a vector
+
+L1error_PCA <- temp_list[seq(1,length(temp_list),6)]
+L1error_random <- temp_list[seq(2,length(temp_list),6)]
+L1error_mean <- temp_list[seq(3,length(temp_list),6)]
+L2error_PCA <- temp_list[seq(4,length(temp_list),6)]
+L2error_random <- temp_list[seq(5,length(temp_list),6)]
+L2error_mean <- temp_list[seq(6,length(temp_list),6)]
+#data_generated <- temp_list[seq(7,length(temp_list),7)]
+
+write.table(L1error_PCA,"L1err50PCA1000_chunk.csv",sep=",")
+write.table(L1error_random,"L1errorRand1000_chunk.csv",sep=",")
+write.table(L1error_mean,"L1errorMean1000_chunk.csv",sep=",")
+write.table(L2error_PCA,"L2err50PCA1000_chunk.csv",sep=",")
+write.table(L2error_random,"L2errorRand1000_chunk.csv",sep=",")
+write.table(L2error_mean,"L2errorMean1000_chunk.csv",sep=",")
+#write.table(data_generated,"generate_50PCA500_chunk.csv",sep=",")
+
+stopCluster(cl)
+
+proc.time()-ptm
+
+
+
+```
